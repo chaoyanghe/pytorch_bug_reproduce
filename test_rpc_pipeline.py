@@ -96,37 +96,18 @@ class DistManager:
         # [BC-Breaking][RFC] Retire ProcessGroup Backend for RPC #55615
         str_init_method = "tcp://" + str(self.master_addr) + ":10000"
         logging.info("str_init_method = {}".format(str_init_method))
-        options = rpc.TensorPipeRpcBackendOptions(
-            num_worker_threads=16, rpc_timeout=20, init_method=str_init_method
+        options = rpc.ProcessGroupRpcBackendOptions(
+            num_send_recv_threads=4, rpc_timeout=0.0, init_method=str_init_method
         )
         rpc.init_rpc(
             "worker:" + str(self.global_rank),
-            backend=rpc.BackendType.TENSORPIPE,
+            backend=dist.rpc.BackendType.PROCESS_GROUP,
             rank=self.global_rank,
             world_size=self.world_size,
             rpc_backend_options=options,
         )
         # torch.distributed.rpc.init_rpc('worker', rank=self.global_rank, world_size=self.world_size)
         logging.info("init_rpc finished.")
-
-
-    # def _init_rpc(self):
-    #     # https://github.com/pytorch/pytorch/issues/55615
-    #     # [BC-Breaking][RFC] Retire ProcessGroup Backend for RPC #55615
-    #     str_init_method = "tcp://" + str(self.master_addr) + ":10000"
-    #     logging.info("str_init_method = {}".format(str_init_method))
-    #     options = rpc.ProcessGroupRpcBackendOptions(
-    #         num_send_recv_threads=4, rpc_timeout=0.0, init_method=str_init_method
-    #     )
-    #     rpc.init_rpc(
-    #         "worker:" + str(self.global_rank),
-    #         backend=dist.rpc.BackendType.PROCESS_GROUP,
-    #         rank=self.global_rank,
-    #         world_size=self.world_size,
-    #         rpc_backend_options=options,
-    #     )
-    #     # torch.distributed.rpc.init_rpc('worker', rank=self.global_rank, world_size=self.world_size)
-    #     logging.info("init_rpc finished.")
 
     def generate_ddp_model(self, model):
         # all_reduce group
@@ -175,12 +156,11 @@ if __name__ == "__main__":
     local_rank = dist_mgr.get_lobal_rank()
 
     batch_size = 8
-    max_seq_length = 2
-    hidden_size = 4
+    hidden_size = 2
 
     device = torch.device("cuda:" + str(local_rank))
 
-    def prepare_training_data(batch_size, max_seq_length, hidden_size):
+    def prepare_training_data(batch_size, hidden_size):
         # logging.info(
         #     "batch_size = {}, max_seq_length = {}, hidden_size = {}".format(
         #         batch_size,
@@ -188,7 +168,7 @@ if __name__ == "__main__":
         #         hidden_size,
         #     )
         # )
-        x_dummpy = torch.rand(batch_size, max_seq_length, hidden_size)
+        x_dummpy = torch.rand(batch_size, hidden_size, hidden_size)
         return x_dummpy
 
 
@@ -196,6 +176,7 @@ if __name__ == "__main__":
         def __init__(self, hidden_size):
             super().__init__()
 
+            self.input_layer = nn.Linear(hidden_size, hidden_size)
             # Step 1: build a model including two linear layers
             fc1 = nn.Linear(hidden_size, hidden_size).cuda(local_rank)
             fc2 = nn.Linear(hidden_size, hidden_size).cuda(local_rank)
@@ -208,6 +189,7 @@ if __name__ == "__main__":
             self.dense = nn.Linear(hidden_size, hidden_size)
 
         def forward(self, hidden_states):
+            hidden_states = self.input_layer(hidden_states)
             pipeline_output = self.pipeline_model(hidden_states)
             output = self.dense(pipeline_output)
             return output
@@ -223,7 +205,7 @@ if __name__ == "__main__":
     super_model.train()
     time_cost_per_iter_total = 0.0
     for iter_idx in range(ITER_NUM):
-        x = prepare_training_data(batch_size, max_seq_length, hidden_size)
+        x = prepare_training_data(batch_size, hidden_size)
         x = x.to(device)
         output = super_model(x)
 
