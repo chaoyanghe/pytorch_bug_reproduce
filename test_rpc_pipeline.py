@@ -96,18 +96,37 @@ class DistManager:
         # [BC-Breaking][RFC] Retire ProcessGroup Backend for RPC #55615
         str_init_method = "tcp://" + str(self.master_addr) + ":10000"
         logging.info("str_init_method = {}".format(str_init_method))
-        options = rpc.ProcessGroupRpcBackendOptions(
-            num_send_recv_threads=4, rpc_timeout=0.0, init_method=str_init_method
+        options = rpc.TensorPipeRpcBackendOptions(
+            num_worker_threads=16, rpc_timeout=20, init_method=str_init_method
         )
         rpc.init_rpc(
             "worker:" + str(self.global_rank),
-            backend=dist.rpc.BackendType.PROCESS_GROUP,
+            backend=rpc.BackendType.TENSORPIPE,
             rank=self.global_rank,
             world_size=self.world_size,
             rpc_backend_options=options,
         )
         # torch.distributed.rpc.init_rpc('worker', rank=self.global_rank, world_size=self.world_size)
         logging.info("init_rpc finished.")
+
+
+    # def _init_rpc(self):
+    #     # https://github.com/pytorch/pytorch/issues/55615
+    #     # [BC-Breaking][RFC] Retire ProcessGroup Backend for RPC #55615
+    #     str_init_method = "tcp://" + str(self.master_addr) + ":10000"
+    #     logging.info("str_init_method = {}".format(str_init_method))
+    #     options = rpc.ProcessGroupRpcBackendOptions(
+    #         num_send_recv_threads=4, rpc_timeout=0.0, init_method=str_init_method
+    #     )
+    #     rpc.init_rpc(
+    #         "worker:" + str(self.global_rank),
+    #         backend=dist.rpc.BackendType.PROCESS_GROUP,
+    #         rank=self.global_rank,
+    #         world_size=self.world_size,
+    #         rpc_backend_options=options,
+    #     )
+    #     # torch.distributed.rpc.init_rpc('worker', rank=self.global_rank, world_size=self.world_size)
+    #     logging.info("init_rpc finished.")
 
     def generate_ddp_model(self, model):
         # all_reduce group
