@@ -9,9 +9,9 @@ import torch.distributed as dist
 from torch import Tensor
 from torch import nn
 from torch.distributed import Backend, rpc
-from torch.distributed.pipeline.sync import Pipe
-from torch.distributed.pipeline.sync.skip import stash, skippable, pop
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from model.tree_moe_model import TreeMoEModel
 
 
 # Based on https://github.com/pytorch/pytorch/pull/40762
@@ -50,11 +50,17 @@ class DistManager:
         self.if_name = if_name
         self.global_rank = -1
         self.local_rank = local_rank
-        self.node_idx = -1
-        self.world_size = -1
+        self.node_idx = 0
+        self.world_size = 8
 
         self.master_addr = master_addr
         self.master_port = master_port
+
+        self.intra_node_all_to_all_process_group_dict = dict()
+        self.intra_node_all_to_all_ranks_dict = dict()
+
+        self.inter_node_all_to_all_process_group_dict = dict()
+        self.inter_node_all_to_all_ranks_dict = dict()
 
     def init(self):
         self._init_ddp()
@@ -95,6 +101,9 @@ class DistManager:
         )
 
         self.ddp_group = None
+
+        self.create_intra_node_all_to_all_process_group()
+        self.create_inter_node_all_to_all_process_group()
 
     def _init_rpc_with_process_group(self):
         # https://github.com/pytorch/pytorch/issues/55615
@@ -152,6 +161,64 @@ class DistManager:
     def get_ddp_group(self):
         return self.ddp_group
 
+    def create_intra_node_all_to_all_process_group(self):
+        n_process_per_node = int(self.world_size / self.num_nodes)
+        for node_idx in range(self.num_nodes):
+            intra_node_all_to_all_ranks = []
+            rank_start = node_idx * n_process_per_node
+            rank_end = (node_idx + 1) * n_process_per_node
+            for rank in range(rank_start, rank_end):
+                intra_node_all_to_all_ranks.append(rank)
+            self.intra_node_all_to_all_process_group_dict[node_idx] = dist.new_group(
+                ranks=intra_node_all_to_all_ranks,
+                backend=Backend.NCCL,
+                timeout=timedelta(days=365),
+            )
+            self.intra_node_all_to_all_ranks_dict[node_idx] = intra_node_all_to_all_ranks
+
+        logging.info(
+            "local_rank = {}, global_rank = {}, ranks = {}".format(
+                self.local_rank,
+                self.global_rank,
+                self.intra_node_all_to_all_ranks_dict[self.node_idx],
+            )
+        )
+
+    def get_intra_node_all_to_all_process_group(self):
+        return self.intra_node_all_to_all_process_group_dict[self.node_idx]
+
+    def get_intra_node_all_to_all_process_group_size(self):
+        return len(self.intra_node_all_to_all_ranks_dict[self.node_idx])
+
+    def create_inter_node_all_to_all_process_group(self):
+        n_process_per_node = int(self.world_size / self.num_nodes)
+        for local_rank in range(n_process_per_node):
+            inter_node_all_to_all_ranks = []
+            for node_idx in range(self.num_nodes):
+                rank = node_idx * n_process_per_node + local_rank
+                inter_node_all_to_all_ranks.append(rank)
+            self.inter_node_all_to_all_ranks_dict[local_rank] = inter_node_all_to_all_ranks
+            self.inter_node_all_to_all_process_group_dict[local_rank] = dist.new_group(
+                ranks=inter_node_all_to_all_ranks,
+                backend=Backend.NCCL,
+                timeout=timedelta(days=365),
+            )
+            self.inter_node_all_to_all_ranks_dict[local_rank] = inter_node_all_to_all_ranks
+
+        logging.info(
+            "local_rank = {}, global_rank = {}, ranks = {}".format(
+                self.local_rank,
+                self.global_rank,
+                self.inter_node_all_to_all_ranks_dict[self.local_rank],
+            )
+        )
+
+    def get_inter_node_all_to_all_process_group(self):
+        return self.inter_node_all_to_all_process_group_dict[self.local_rank]
+
+    def get_inter_node_all_to_all_process_group_size(self):
+        return len(self.inter_node_all_to_all_ranks_dict[self.local_rank])
+
 
 class PipeModelWrapper(nn.Module):
     def __init__(self, pipe_model):
@@ -195,8 +262,14 @@ if __name__ == "__main__":
     global_rank = dist_mgr.get_global_rank()
     local_rank = dist_mgr.get_lobal_rank()
 
-    batch_size = 16
-    hidden_size = 2
+    b_open_pipeline = True
+    pipe_chunk_size = 4
+
+    batch_size = 32
+    hidden_size = 1024
+    intermediate_size = 4096
+    hidden_dropout_prob = 0.1
+    sequence_length = 128
 
     device = torch.device("cuda:" + str(local_rank))
 
@@ -211,77 +284,33 @@ if __name__ == "__main__":
         x_dummpy = torch.rand(batch_size, hidden_size, hidden_size)
         return x_dummpy
 
-    @skippable(stash=["1to3"])
-    class Layer1(nn.Module):
-        def __init__(self, hidden_size):
-            super().__init__()
-            self.fc1 = nn.Linear(hidden_size, hidden_size).cuda(local_rank)
+    tree_moe_model = TreeMoEModel(
+        dist_mgr.get_intra_node_all_to_all_process_group(),
+        dist_mgr.get_intra_node_all_to_all_process_group_size(),
+        dist_mgr.get_inter_node_all_to_all_process_group(),
+        dist_mgr.get_inter_node_all_to_all_process_group_size(),
+        args.global_rank,
+        args.local_rank,
+        hidden_size,
+        intermediate_size,
+        hidden_dropout_prob,
+        sequence_length,
+        pipe_chunk_size=pipe_chunk_size,
+        b_open_pipeline=b_open_pipeline,
+    )
+    tree_moe_model.to(device)
 
-        def forward(self, input):
-            # logging.info("(before alltoall) global_rank = {}, input = {}".format(global_rank, input))
-            input = _AllToAll.apply(dist_mgr.get_ddp_group(), input)
-            # logging.info("(after alltoall) global_rank = {}, input = {}".format(global_rank, input))
-            yield stash("1to3", input)
-            return self.fc1(input)
-
-    class Layer2(nn.Module):
-        def __init__(self, hidden_size):
-            super().__init__()
-            self.fc2 = nn.Linear(hidden_size, hidden_size).cuda(local_rank)
-
-        def forward(self, input):
-            return self.fc2(input)
-
-    @skippable(pop=["1to3"])
-    class Layer3(nn.Module):
-        def __init__(self, hidden_size):
-            super().__init__()
-            self.fc3 = nn.Linear(hidden_size, hidden_size).cuda(local_rank)
-
-        def forward(self, input):
-            skip_1to3 = yield pop("1to3")
-            return self.fc3(input) + skip_1to3
-
-    class SuperModel(nn.Module):
-        def __init__(self, hidden_size):
-            super().__init__()
-
-            self.input_layer = nn.Linear(hidden_size, hidden_size)
-
-            layer1 = Layer1(hidden_size)
-            layer2 = Layer2(hidden_size)
-            layer3 = Layer3(hidden_size)
-            # Step 2: wrap the two layers with nn.Sequential
-            pipeline_model = nn.Sequential(layer1, layer2, layer3)
-
-            # Step 3: build Pipe (torch.distributed.pipeline.sync.Pipe)
-            self.pipeline_model = PipeModelWrapper(
-                Pipe(pipeline_model, chunks=2, checkpoint="never")
-            )
-            # self.pipeline_model = Pipe(pipeline_model, chunks=4, checkpoint="never")
-
-            self.dense = nn.Linear(hidden_size, hidden_size)
-
-        def forward(self, hidden_states):
-            hidden_states = self.input_layer(hidden_states)
-            pipeline_output = self.pipeline_model(hidden_states)
-            output = self.dense(pipeline_output)
-            return output
-
-    super_model = SuperModel(hidden_size)
-    super_model.to(device)
-
-    super_model = dist_mgr.generate_ddp_model(super_model)
+    tree_moe_model = dist_mgr.generate_ddp_model(tree_moe_model)
     if global_rank == 0:
-        logging.info(super_model)
+        logging.info(tree_moe_model)
 
     ITER_NUM = 1
-    super_model.train()
+    tree_moe_model.train()
     time_cost_per_iter_total = 0.0
     for iter_idx in range(ITER_NUM):
         x = prepare_training_data(batch_size, hidden_size)
         x = x.to(device)
-        output = super_model(x)
+        output = tree_moe_model(x)
 
         # define a loss
         loss = torch.sum(output)
@@ -289,3 +318,60 @@ if __name__ == "__main__":
 
         if global_rank == 0:
             logging.info("loss = {}".format(loss))
+
+    # @skippable(stash=["1to3"])
+    # class Layer1(nn.Module):
+    #     def __init__(self, hidden_size):
+    #         super().__init__()
+    #         self.fc1 = nn.Linear(hidden_size, hidden_size).cuda(local_rank)
+    #
+    #     def forward(self, input):
+    #         # logging.info("(before alltoall) global_rank = {}, input = {}".format(global_rank, input))
+    #         input = _AllToAll.apply(dist_mgr.get_ddp_group(), input)
+    #         # logging.info("(after alltoall) global_rank = {}, input = {}".format(global_rank, input))
+    #         yield stash("1to3", input)
+    #         return self.fc1(input)
+    #
+    # class Layer2(nn.Module):
+    #     def __init__(self, hidden_size):
+    #         super().__init__()
+    #         self.fc2 = nn.Linear(hidden_size, hidden_size).cuda(local_rank)
+    #
+    #     def forward(self, input):
+    #         return self.fc2(input)
+    #
+    # @skippable(pop=["1to3"])
+    # class Layer3(nn.Module):
+    #     def __init__(self, hidden_size):
+    #         super().__init__()
+    #         self.fc3 = nn.Linear(hidden_size, hidden_size).cuda(local_rank)
+    #
+    #     def forward(self, input):
+    #         skip_1to3 = yield pop("1to3")
+    #         return self.fc3(input) + skip_1to3
+
+    # class SuperModel(nn.Module):
+    #     def __init__(self, hidden_size):
+    #         super().__init__()
+    #
+    #         self.input_layer = nn.Linear(hidden_size, hidden_size)
+    #
+    #         layer1 = Layer1(hidden_size)
+    #         layer2 = Layer2(hidden_size)
+    #         layer3 = Layer3(hidden_size)
+    #         # Step 2: wrap the two layers with nn.Sequential
+    #         pipeline_model = nn.Sequential(layer1, layer2, layer3)
+    #
+    #         # Step 3: build Pipe (torch.distributed.pipeline.sync.Pipe)
+    #         self.pipeline_model = PipeModelWrapper(
+    #             Pipe(pipeline_model, chunks=2, checkpoint="never")
+    #         )
+    #         # self.pipeline_model = Pipe(pipeline_model, chunks=4, checkpoint="never")
+    #
+    #         self.dense = nn.Linear(hidden_size, hidden_size)
+    #
+    #     def forward(self, hidden_states):
+    #         hidden_states = self.input_layer(hidden_states)
+    #         pipeline_output = self.pipeline_model(hidden_states)
+    #         output = self.dense(pipeline_output)
+    #         return output

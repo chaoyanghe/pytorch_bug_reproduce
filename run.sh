@@ -27,7 +27,7 @@ python3 -m launch \
 --nproc_per_node=$NPROC_PER_NODE --nnodes=$NNODE --node_rank=$NODE_RANK \
 --master_addr $MASTER_ADDR \
 --master_port $MASTER_PORT \
-test_rpc_pipeline.py \
+main.py \
 --nnodes $NNODE \
 --nproc_per_node=$NPROC_PER_NODE \
 --node_rank $NODE_RANK \
